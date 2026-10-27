@@ -1,0 +1,6 @@
+# Copy to prod.backend.hcl and run: terraform init -backend-config=envs/prod.backend.hcl
+bucket         = "REPLACE-terraform-state-bucket"
+key            = "hdb-resale/prod.tfstate"
+region         = "ap-southeast-1"
+dynamodb_table = "REPLACE-terraform-locks"
+encrypt        = true

@@ -1,0 +1,216 @@
+name: Release
+
+# Dev -> Test -> Prod for the HDB Resale apps, with gates:
+#   static checks -> deploy to Test -> unit + integration + e2e tests (all must pass)
+#   -> UI smoke -> AI Mentor Studio review -> manual approval (GitHub environment "production")
+#   -> deploy Core + Admin + UI to Prod (never the Tests app) -> health check -> automatic rollback on failure.
+#
+# Repository variables (Settings > Variables):
+#   LT_URL, LT_ENV_DEV, LT_ENV_TEST, LT_ENV_PROD        e.g. https://lifetime.example.com, Development, Test, Production
+#   LT_APPS_PROD        comma list, e.g. "HDB Resale,Singapore HDB Insight"   ("HDB Resale" = Core + Admin modules; UI app)
+#   LT_APPS_TEST_ONLY   e.g. "HDB Resale Tests"
+#   TEST_HOST, PROD_HOST                                 e.g. test.example.com, hdb.example.com
+#   AI_MENTOR_URL       link shown in the review checklist
+# Secrets: LT_TOKEN (LifeTime service account), TEST_API_TOKEN (HDBResale_Tests runner).
+# Environment "production" must have required reviewers configured: that is the manual approval gate.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to tag in Development (semver, e.g. 1.4.0)"
+        required: true
+      changelog:
+        description: "Change log for the LifeTime version"
+        required: true
+        default: "Release"
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  checks: write
+
+env:
+  LT_URL: ${{ vars.LT_URL }}
+
+jobs:
+  static-checks:
+    uses: ./.github/workflows/ci.yml
+
+  deploy-test:
+    name: Tag in Dev and deploy to Test
+    needs: static-checks
+    runs-on: ubuntu-latest
+    environment: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate version input
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "version must be semver x.y.z"; exit 1; }
+      - name: Tag versions in Development
+        env:
+          LT_TOKEN: ${{ secrets.LT_TOKEN }}
+          VERSION: ${{ inputs.version }}
+          CHANGELOG: ${{ inputs.changelog }}
+        run: >
+          python scripts/lifetime.py tag --env "${{ vars.LT_ENV_DEV }}"
+          --apps "${{ vars.LT_APPS_PROD }},${{ vars.LT_APPS_TEST_ONLY }}"
+          --version "$VERSION" --changelog "$CHANGELOG" --out tagged-versions.json
+      - name: Deploy Development -> Test (Core + Admin, UI and Tests apps)
+        env:
+          LT_TOKEN: ${{ secrets.LT_TOKEN }}
+        run: >
+          python scripts/lifetime.py deploy --source "${{ vars.LT_ENV_DEV }}" --target "${{ vars.LT_ENV_TEST }}"
+          --apps "${{ vars.LT_APPS_PROD }},${{ vars.LT_APPS_TEST_ONLY }}" --notes "Release ${{ inputs.version }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tagged-versions
+          path: tagged-versions.json
+
+  platform-tests:
+    name: Platform tests (${{ matrix.suite }})
+    needs: deploy-test
+    runs-on: ubuntu-latest
+    environment: test
+    strategy:
+      fail-fast: true
+      max-parallel: 1          # suites share the Test database; e2e must not overlap integration
+      matrix:
+        suite: [unit, integration, e2e]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run ${{ matrix.suite }} suite in HDBResale_Tests
+        env:
+          TESTS_BASE_URL: https://${{ vars.TEST_HOST }}/HDBResale_Tests
+          TEST_API_TOKEN: ${{ secrets.TEST_API_TOKEN }}
+        run: ./scripts/run-tests.sh "${{ matrix.suite }}" "junit-${{ matrix.suite }}.xml"
+      - name: Publish test report
+        if: always()
+        uses: mikepenz/action-junit-report@v4
+        with:
+          report_paths: junit-${{ matrix.suite }}.xml
+          check_name: Platform tests (${{ matrix.suite }})
+          fail_on_failure: true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: junit-${{ matrix.suite }}
+          path: junit-${{ matrix.suite }}.xml
+
+  ui-smoke:
+    name: UI smoke (Playwright, Test env)
+    needs: platform-tests
+    runs-on: ubuntu-latest
+    environment: test
+    defaults:
+      run:
+        working-directory: tests/ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: tests/ui/package-lock.json
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npx playwright test
+        env:
+          UI_BASE_URL: https://${{ vars.TEST_HOST }}/SingaporeHDBInsight/
+          ADMIN_BASE_URL: https://${{ vars.TEST_HOST }}/HDBResale_Admin/
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-report
+          path: tests/ui/playwright-report
+
+  review-checklist:
+    name: Pre-production review checklist
+    needs: deploy-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write checklist for the approver
+        run: |
+          {
+            echo "## Release ${{ inputs.version }}: approver checklist"
+            echo "- [ ] AI Mentor Studio shows **no new critical findings** for HDBResale_Core / HDBResale_Admin / SingaporeHDBInsight: ${{ vars.AI_MENTOR_URL }}"
+            echo "- [ ] Platform test reports (unit, integration, e2e) are green on this run"
+            echo "- [ ] UI smoke passed (includes: SyncAdmin unreachable anonymously, absent from the public app)"
+            echo "- [ ] Prod WAF admin_allowed_cidrs still matches the corporate egress ranges"
+            echo "- [ ] Production site properties unchanged: TestSupportEnabled=False, SearchApiEnabled=False"
+            echo "- [ ] Change log reviewed: ${{ inputs.changelog }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy-prod:
+    name: Deploy Test -> Production (Core + Admin + UI)
+    needs: [platform-tests, ui-smoke, review-checklist]
+    runs-on: ubuntu-latest
+    environment: production     # required reviewers = manual approval gate
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Record current Production versions (rollback point)
+        env:
+          LT_TOKEN: ${{ secrets.LT_TOKEN }}
+        run: python scripts/lifetime.py current-versions --env "${{ vars.LT_ENV_PROD }}" --apps "${{ vars.LT_APPS_PROD }}" --out prod-before.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prod-before
+          path: prod-before.json
+      - name: Deploy (Tests app is deliberately excluded)
+        env:
+          LT_TOKEN: ${{ secrets.LT_TOKEN }}
+        run: >
+          python scripts/lifetime.py deploy --source "${{ vars.LT_ENV_TEST }}" --target "${{ vars.LT_ENV_PROD }}"
+          --apps "${{ vars.LT_APPS_PROD }}" --notes "Release ${{ inputs.version }}"
+
+  verify-prod:
+    name: Post-deploy health gate
+    needs: deploy-prod
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Health must be OK (retries for 5 minutes while the app warms up)
+        env:
+          CORE_BASE_URL: https://${{ vars.PROD_HOST }}/HDBResale_Core
+        run: |
+          for i in $(seq 1 10); do
+            if ./scripts/check-health.sh; then exit 0; fi
+            echo "attempt $i failed; retrying in 30s"; sleep 30
+          done
+          exit 1
+
+  rollback:
+    name: Roll back Production
+    needs: [deploy-prod, verify-prod]
+    if: failure() && needs.deploy-prod.result == 'success'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: prod-before
+      - name: Redeploy the previous Production versions
+        env:
+          LT_TOKEN: ${{ secrets.LT_TOKEN }}
+        run: >
+          python scripts/lifetime.py deploy-versions --source "${{ vars.LT_ENV_TEST }}" --target "${{ vars.LT_ENV_PROD }}"
+          --versions-file prod-before.json --notes "Automatic rollback of ${{ inputs.version }}"
+      - name: Health after rollback
+        env:
+          CORE_BASE_URL: https://${{ vars.PROD_HOST }}/HDBResale_Core
+        run: ./scripts/check-health.sh

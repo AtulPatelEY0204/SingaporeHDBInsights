@@ -1,0 +1,9 @@
+environment              = "test"
+app_hostname             = "test.hdb.example.com"
+certificate_arn          = "arn:aws:acm:ap-southeast-1:111111111111:certificate/REPLACE-ME"
+frontend_count           = 1
+frontend_instance_type   = "m6i.large"
+db_instance_class        = "db.m6i.large"
+db_backup_retention_days = 7
+alert_emails             = ["ops@example.com"]
+admin_allowed_cidrs      = ["203.0.113.0/24"] # REPLACE-ME: corporate egress / VPN ranges

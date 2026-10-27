@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+junit-*.xml
+# NOTE: do not ignore infra/canary/nodejs/node_modules - that is the canary source layout Synthetics requires.

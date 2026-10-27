@@ -1,0 +1,6 @@
+# Copy to test.backend.hcl and run: terraform init -reconfigure -backend-config=envs/test.backend.hcl
+bucket         = "REPLACE-terraform-state-bucket"
+key            = "hdb-resale/test.tfstate"
+region         = "ap-southeast-1"
+dynamodb_table = "REPLACE-terraform-locks"
+encrypt        = true

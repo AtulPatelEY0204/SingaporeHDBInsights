@@ -1,0 +1,14 @@
+{
+  "name": "hdb-resale-ui-tests",
+  "private": true,
+  "description": "Playwright smoke tests for PriceCheck and the HDBResale_Admin access rule",
+  "scripts": {
+    "test": "playwright test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.48.2",
+    "@types/node": "20.17.6",
+    "typescript": "5.6.3"
+  }
+}

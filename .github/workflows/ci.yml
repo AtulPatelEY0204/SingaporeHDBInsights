@@ -1,0 +1,77 @@
+name: CI
+
+# Static checks for everything in this repo (the OutSystems modules themselves
+# are validated by TrueChange on publish and by the in-platform test suites).
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  scripts:
+    name: Shell + Python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck scripts/*.sh
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: LifeTime client unit tests
+        run: python -m unittest discover -s tests/py -v
+
+  terraform:
+    name: Terraform fmt + validate
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+      - run: terraform fmt -check -recursive
+      - run: terraform init -backend=false -input=false
+      - run: terraform validate
+
+  workflows:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: actionlint
+        run: |
+          bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.4/scripts/download-actionlint.bash) 1.7.4
+          ./actionlint -color
+
+  load-test:
+    name: k6 script check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: grafana/setup-k6-action@v1
+      - name: k6 inspect (parses script and options, no traffic)
+        run: k6 inspect tests/load/search.js
+
+  ui-tests:
+    name: Playwright typecheck
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tests/ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: tests/ui/package-lock.json
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npx playwright test --list
